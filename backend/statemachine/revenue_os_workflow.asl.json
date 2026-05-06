@@ -1,0 +1,246 @@
+{
+  "Comment": "RevenueOS autonomous revenue workflow",
+  "StartAt": "UpdateStatus_Executing",
+  "States": {
+    "UpdateStatus_Executing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${DynamoDBTableName}",
+        "Key": {
+          "leadId": {
+            "S.$": "$.leadId"
+          }
+        },
+        "UpdateExpression": "SET #st = :st, updated_at = :ua",
+        "ExpressionAttributeNames": {
+          "#st": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":st": {
+            "S": "EXECUTING"
+          },
+          ":ua": {
+            "S.$": "$$.Execution.StartTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "ParallelActions"
+    },
+    "ParallelActions": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "ReplyBranch",
+          "States": {
+            "ReplyBranch": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ReplyLambdaArn}",
+                "Payload": {
+                  "leadId.$": "$.leadId"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "MaxAttempts": 3,
+                  "IntervalSeconds": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "ReplyFallback"
+                }
+              ],
+              "ResultPath": "$.replyResult",
+              "End": true
+            },
+            "ReplyFallback": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${FallbackLambdaArn}",
+                "Payload": {
+                  "leadId.$": "$.leadId",
+                  "failed_branch": "reply",
+                  "Error.$": "$.error.Error",
+                  "Cause.$": "$.error.Cause"
+                }
+              },
+              "ResultPath": "$.fallbackResult",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "PaymentBranch",
+          "States": {
+            "PaymentBranch": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${PaymentLambdaArn}",
+                "Payload": {
+                  "leadId.$": "$.leadId"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "MaxAttempts": 3,
+                  "IntervalSeconds": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "PaymentFallback"
+                }
+              ],
+              "ResultPath": "$.paymentResult",
+              "End": true
+            },
+            "PaymentFallback": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${FallbackLambdaArn}",
+                "Payload": {
+                  "leadId.$": "$.leadId",
+                  "failed_branch": "payment",
+                  "Error.$": "$.error.Error",
+                  "Cause.$": "$.error.Cause"
+                }
+              },
+              "ResultPath": "$.fallbackResult",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ProposalBranch",
+          "States": {
+            "ProposalBranch": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ProposalLambdaArn}",
+                "Payload": {
+                  "leadId.$": "$.leadId"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "MaxAttempts": 3,
+                  "IntervalSeconds": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "ProposalFallback"
+                }
+              ],
+              "ResultPath": "$.proposalResult",
+              "End": true
+            },
+            "ProposalFallback": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${FallbackLambdaArn}",
+                "Payload": {
+                  "leadId.$": "$.leadId",
+                  "failed_branch": "proposal",
+                  "Error.$": "$.error.Error",
+                  "Cause.$": "$.error.Cause"
+                }
+              },
+              "ResultPath": "$.fallbackResult",
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.parallelResults",
+      "Next": "SlackNotify"
+    },
+    "SlackNotify": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SlackNotifyLambdaArn}",
+        "Payload": {
+          "leadId.$": "$.leadId"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "ResultPath": "$.slackResult",
+      "Next": "ScheduleFollowUp"
+    },
+    "ScheduleFollowUp": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ScheduleFollowUpLambdaArn}",
+        "Payload": {
+          "leadId.$": "$.leadId"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 1,
+          "BackoffRate": 2
+        }
+      ],
+      "ResultPath": "$.scheduleResult",
+      "Next": "UpdateStatus_Completed"
+    },
+    "UpdateStatus_Completed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${DynamoDBTableName}",
+        "Key": {
+          "leadId": {
+            "S.$": "$.leadId"
+          }
+        },
+        "UpdateExpression": "SET #st = :st, updated_at = :ua",
+        "ExpressionAttributeNames": {
+          "#st": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":st": {
+            "S": "COMPLETED"
+          },
+          ":ua": {
+            "S.$": "$$.Execution.StartTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "End": true
+    }
+  }
+}

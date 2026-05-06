@@ -1,0 +1,19 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "revenueos"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+stack_name = "revenueos"
+region = "us-east-1"
+capabilities = "CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+confirm_changeset = false
+disable_rollback = false
+no_fail_on_empty_changeset = true
+# Set your values here — or pass them via --parameter-overrides on the CLI
+parameter_overrides = "StageName=prod SESEmail=your-verified-email@gmail.com S3ProposalsBucket=your-proposals-bucket FollowUpMinutes=2"

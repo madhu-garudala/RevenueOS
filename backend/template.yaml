@@ -1,0 +1,454 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: RevenueOS — Autonomous Revenue Operations Agent
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 256
+    Environment:
+      Variables:
+        DYNAMODB_TABLE_NAME: !Ref RevenueOSLeads
+        BEDROCK_MODEL_ID: !Sub "us.anthropic.claude-sonnet-4-6"
+        SES_EMAIL: !Ref SESEmail
+        SES_REGION: !Ref AWS::Region
+        S3_PROPOSALS_BUCKET: !Ref S3ProposalsBucket
+    Layers: []
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+
+  SESEmail:
+    Type: String
+    Description: SES-verified email address used as sender and recipient for all emails.
+    Default: your-verified-email@gmail.com
+
+  S3ProposalsBucket:
+    Type: String
+    Description: Name of the existing S3 bucket that holds the proposal PDF.
+    Default: your-proposals-bucket
+
+  FollowUpMinutes:
+    Type: Number
+    Description: Minutes to wait before sending the follow-up email (use 2 for demo, 2880 for production).
+    Default: 2
+
+Resources:
+
+  # ─── DynamoDB ────────────────────────────────────────────────────────────────
+  RevenueOSLeads:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: RevenueOSLeads
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: leadId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: leadId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # ─── SNS Topic ───────────────────────────────────────────────────────────────
+  EscalationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: revenueos-escalation
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref SESEmail
+
+  # ─── API Gateway ─────────────────────────────────────────────────────────────
+  RevenueOSApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowHeaders:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+
+  # ─── EventBridge Scheduler Role ──────────────────────────────────────────────
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: revenueos-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeFollowupLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:revenueos-followup"
+
+  # ─── Step Functions Role ─────────────────────────────────────────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: revenueos-statemachine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StateMachinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ReplyLambdaFunction.Arn
+                  - !GetAtt PaymentLambdaFunction.Arn
+                  - !GetAtt ProposalLambdaFunction.Arn
+                  - !GetAtt SlackNotifyLambdaFunction.Arn
+                  - !GetAtt FallbackLambdaFunction.Arn
+                  - !GetAtt ScheduleFollowupLambdaFunction.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt RevenueOSLeads.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+
+  # ─── Step Functions State Machine ────────────────────────────────────────────
+  RevenueOSStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: RevenueOSWorkflow
+      DefinitionUri: statemachine/revenue_os_workflow.asl.json
+      DefinitionSubstitutions:
+        DynamoDBTableName: !Ref RevenueOSLeads
+        ReplyLambdaArn: !GetAtt ReplyLambdaFunction.Arn
+        PaymentLambdaArn: !GetAtt PaymentLambdaFunction.Arn
+        ProposalLambdaArn: !GetAtt ProposalLambdaFunction.Arn
+        SlackNotifyLambdaArn: !GetAtt SlackNotifyLambdaFunction.Arn
+        FallbackLambdaArn: !GetAtt FallbackLambdaFunction.Arn
+        ScheduleFollowUpLambdaArn: !GetAtt ScheduleFollowupLambdaFunction.Arn
+      Role: !GetAtt StateMachineRole.Arn
+
+  # ─── Lambda Functions ─────────────────────────────────────────────────────────
+
+  IngestEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-ingest-event
+      CodeUri: functions/ingest_event/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          ANALYZE_INTENT_FUNCTION_NAME: !Ref AnalyzeIntentFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt AnalyzeIntentFunction.Arn
+      Events:
+        PostEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RevenueOSApi
+            Path: /event
+            Method: POST
+        SlackEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RevenueOSApi
+            Path: /slack/events
+            Method: POST
+
+  AnalyzeIntentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-analyze-intent
+      CodeUri: functions/analyze_intent/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref RevenueOSStateMachine
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource: "*"
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref RevenueOSStateMachine
+
+  ReplyLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-reply
+      CodeUri: functions/reply_lambda/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource: "*"
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: "*"
+
+  PaymentLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-payment
+      CodeUri: functions/payment_lambda/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          SECRET_STRIPE: "revenueos/stripe/secret-key"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:revenueos/stripe/secret-key*"
+
+  ProposalLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-proposal
+      CodeUri: functions/proposal_lambda/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !Sub "arn:aws:s3:::${S3ProposalsBucket}"
+                - !Sub "arn:aws:s3:::${S3ProposalsBucket}/*"
+
+  SlackNotifyLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-slack-notify
+      CodeUri: functions/slack_notify_lambda/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          SECRET_SLACK_WEBHOOK: "revenueos/slack/webhook-url"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:revenueos/slack/webhook-url*"
+
+  FallbackLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-fallback
+      CodeUri: functions/fallback_lambda/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref EscalationTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: "*"
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref EscalationTopic
+
+  FollowupLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-followup
+      CodeUri: functions/followup_lambda/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          FOLLOWUP_FUNCTION_ARN: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:revenueos-followup"
+          SCHEDULER_ROLE_ARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/revenueos-scheduler-role"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource: "*"
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:DeleteSchedule
+              Resource: "*"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/revenueos-scheduler-role"
+
+  ScheduleFollowupLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-schedule-followup
+      CodeUri: functions/schedule_followup_lambda/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          FOLLOWUP_FUNCTION_ARN: !GetAtt FollowupLambdaFunction.Arn
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerExecutionRole.Arn
+          FOLLOW_UP_MINUTES: !Ref FollowUpMinutes
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:DeleteSchedule
+              Resource: "*"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerExecutionRole.Arn
+
+  TranscribeLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-transcribe
+      CodeUri: functions/transcribe_lambda/
+      Handler: app.lambda_handler
+      Timeout: 120
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref RevenueOSStateMachine
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RevenueOSLeads
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !Sub "arn:aws:s3:::${S3ProposalsBucket}"
+                - !Sub "arn:aws:s3:::${S3ProposalsBucket}/*"
+            - Effect: Allow
+              Action:
+                - transcribe:StartTranscriptionJob
+                - transcribe:GetTranscriptionJob
+              Resource: "*"
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref RevenueOSStateMachine
+      Events:
+        PostTranscribe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RevenueOSApi
+            Path: /transcribe
+            Method: POST
+
+  GetLeadsLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: revenueos-get-leads
+      CodeUri: functions/get_leads_lambda/
+      Handler: app.lambda_handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !GetAtt RevenueOSLeads.Arn
+      Events:
+        GetLeads:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RevenueOSApi
+            Path: /leads
+            Method: GET
+
+# ─── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL — set this as VITE_API_URL in frontend/.env
+    Value: !Sub "https://${RevenueOSApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+    Export:
+      Name: RevenueOSApiUrl
+
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref RevenueOSStateMachine
+    Export:
+      Name: RevenueOSStateMachineArn
+
+  DynamoDBTableName:
+    Description: DynamoDB table name
+    Value: !Ref RevenueOSLeads
+    Export:
+      Name: RevenueOSDynamoDBTable

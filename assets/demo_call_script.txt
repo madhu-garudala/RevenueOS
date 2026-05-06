@@ -1,0 +1,27 @@
+REVENUEOS DEMO CALL SCRIPT
+==========================
+Duration: ~40 seconds when spoken at normal pace
+
+---
+
+"Hi Priya, great speaking with you today. So as we discussed, I'll send over the revised contract
+by end of Thursday. We'll also schedule the technical review for next week — Tuesday works best
+for our team. On the budget side, you mentioned Q3 is the right time to move forward, and we're
+confident RevenueOS will show ROI within the first month. Looking forward to getting this across
+the line."
+
+---
+
+WHAT THIS SHOULD PRODUCE:
+
+Action items:
+- Send revised contract by end of Thursday
+- Schedule technical review for Tuesday next week
+
+Implicit commitments:
+- Budget decision tied to Q3 timeline
+- ROI expected within first month
+
+Deal stage: late
+Deal risk: low
+Sentiment: positive
